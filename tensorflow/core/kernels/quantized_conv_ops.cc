@@ -18,15 +18,17 @@ limitations under the License.
 #include <algorithm>
 #include <vector>
 
+#include "tensorflow/core/platform/errors.h"
+
 #define EIGEN_USE_THREADS
 
 #define GEMMLOWP_ALLOW_SLOW_SCALAR_FALLBACK
 #include "public/gemmlowp.h"
+#include "tensorflow/core/framework/kernel_shape_util.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/kernels/conv_ops.h"
 #include "tensorflow/core/kernels/meta_support.h"
-#include "tensorflow/core/kernels/ops_util.h"
 #include "tensorflow/core/kernels/quantization_utils.h"
 #include "tensorflow/core/kernels/reference_gemm.h"
 #include "tensorflow/core/lib/core/errors.h"
@@ -227,8 +229,12 @@ class Im2ColConvFunctor {
       return;
     }
 
-    CHECK_GT(output_width, 0);
-    CHECK_GT(output_height, 0);
+    OP_REQUIRES(
+        context, output_width > 0,
+        errors::InvalidArgument("output_width must be strictly positive"));
+    OP_REQUIRES(
+        context, output_height > 0,
+        errors::InvalidArgument("output_height must be strictly positive"));
     int filter_left_offset;
     int filter_top_offset;
     if (padding == VALID) {
@@ -255,6 +261,9 @@ class Im2ColConvFunctor {
     // by the width, then the height. This is the standard memory order in the
     // image world if it helps to visualize it.
     const int filter_value_count = filter_width * filter_height * input_depth;
+    OP_REQUIRES(context, filter_value_count > 0,
+                errors::InvalidArgument(
+                    "filter patch must contain at least one element"));
     const int64 patches_per_chunk =
         kMaxChunkSize / (filter_value_count * sizeof(T1));
     const int64 chunk_value_count =
@@ -268,13 +277,19 @@ class Im2ColConvFunctor {
     Im2ColBufferResource<T1, chunk_value_count>* im2col_buffer_resource;
     std::function<Status(Im2ColBufferResource<T1, chunk_value_count>**)>
         creator = [](Im2ColBufferResource<T1, chunk_value_count>** resource) {
+#ifdef _MSC_VER
+          // MSVC complains about the capture of chunk_value_count which oddly
+          // works fine in conv_ops_using_gemm.cc for example.
+          // Define chunk_value_count inside the lambda for now.
+          const int64 chunk_value_count =
+              (kMaxChunkSize + (sizeof(T1) - 1)) / sizeof(T1);
+#endif
           *resource = new Im2ColBufferResource<T1, chunk_value_count>();
           return Status::OK();
         };
-    OP_REQUIRES_OK(
-        context,
-        context->resource_manager()->LookupOrCreate(
-            "Conv2d", "im2col_buffer", &im2col_buffer_resource, creator));
+    OP_REQUIRES_OK(context, context->resource_manager()->LookupOrCreate(
+                                "Conv2d", "im2col_buffer",
+                                &im2col_buffer_resource, creator));
     // This means that multiple ops can't be run simultaneously on different
     // threads, because we have a single shared resource. The platforms this is
     // aimed at have intra-op parallelism as their focus though, so it shouldn't
@@ -457,6 +472,19 @@ class QuantizedConv2DOp : public OpKernel {
         context, (strides_[0] == 1 && strides_[3] == 1),
         errors::InvalidArgument("Current implementation does not yet support "
                                 "strides in the batch and depth dimensions."));
+    std::vector<int32> dilations;
+    OP_REQUIRES_OK(context, context->GetAttr("dilations", &dilations));
+    OP_REQUIRES(context, dilations.size() == 4,
+                errors::InvalidArgument("Dilations field must "
+                                        "specify 4 dimensions"));
+    OP_REQUIRES(context, dilations[1] == 1 && dilations[2] == 1,
+                errors::InvalidArgument(
+                    "Current implementation only supports dilated rate as 1 "
+                    "in the row and column dimensions."));
+    OP_REQUIRES(context, (dilations[0] == 1 && dilations[3] == 1),
+                errors::InvalidArgument(
+                    "Current implementation does not yet support "
+                    "dilations in the batch and depth dimensions."));
     OP_REQUIRES_OK(context, context->GetAttr("padding", &padding_));
   }
 

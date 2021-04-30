@@ -28,7 +28,7 @@ limitations under the License.
 namespace tensorflow {
 
 /// \brief An LRU cache of string keys and arbitrary values, with configurable
-/// max item age and max entries.
+/// max item age (in seconds) and max entries.
 ///
 /// This class is thread safe.
 template <typename T>
@@ -48,16 +48,15 @@ class ExpiringLRUCache {
       return;
     }
     mutex_lock lock(mu_);
-    lru_list_.push_front(key);
-    Entry entry{env_->NowSeconds(), value, lru_list_.begin()};
-    auto insert = cache_.insert(std::make_pair(key, entry));
-    if (!insert.second) {
-      lru_list_.erase(insert.first->second.lru_iterator);
-      insert.first->second = entry;
-    } else if (max_entries_ > 0 && cache_.size() > max_entries_) {
-      cache_.erase(lru_list_.back());
-      lru_list_.pop_back();
-    }
+    InsertLocked(key, value);
+  }
+
+  // Delete the entry with key `key`. Return true if the entry was found for
+  // `key`, false if the entry was not found. In both cases, there is no entry
+  // with key `key` existed after the call.
+  bool Delete(const string& key) {
+    mutex_lock lock(mu_);
+    return DeleteLocked(key);
   }
 
   /// Look up the entry with key `key` and copy it to `value` if found. Returns
@@ -68,19 +67,40 @@ class ExpiringLRUCache {
       return false;
     }
     mutex_lock lock(mu_);
-    auto it = cache_.find(key);
-    if (it == cache_.end()) {
-      return false;
+    return LookupLocked(key, value);
+  }
+
+  typedef std::function<Status(const string&, T*)> ComputeFunc;
+
+  /// Look up the entry with key `key` and copy it to `value` if found. If not
+  /// found, call `compute_func`. If `compute_func` returns successfully, store
+  /// a copy of the output parameter in the cache, and another copy in `value`.
+  Status LookupOrCompute(const string& key, T* value,
+                         const ComputeFunc& compute_func) {
+    if (max_age_ == 0) {
+      return compute_func(key, value);
     }
-    lru_list_.erase(it->second.lru_iterator);
-    if (env_->NowSeconds() - it->second.timestamp > max_age_) {
-      cache_.erase(it);
-      return false;
+
+    // Note: we hold onto mu_ for the rest of this function. In practice, this
+    // is okay, as stat requests are typically fast, and concurrent requests are
+    // often for the same file. Future work can split this up into one lock per
+    // key if this proves to be a significant performance bottleneck.
+    mutex_lock lock(mu_);
+    if (LookupLocked(key, value)) {
+      return Status::OK();
     }
-    *value = it->second.value;
-    lru_list_.push_front(it->first);
-    it->second.lru_iterator = lru_list_.begin();
-    return true;
+    Status s = compute_func(key, value);
+    if (s.ok()) {
+      InsertLocked(key, *value);
+    }
+    return s;
+  }
+
+  /// Clear the cache.
+  void Clear() {
+    mutex_lock lock(mu_);
+    cache_.clear();
+    lru_list_.clear();
   }
 
   /// Accessors for cache parameters.
@@ -99,6 +119,47 @@ class ExpiringLRUCache {
     std::list<string>::iterator lru_iterator;
   };
 
+  bool LookupLocked(const string& key, T* value)
+      TF_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+    auto it = cache_.find(key);
+    if (it == cache_.end()) {
+      return false;
+    }
+    lru_list_.erase(it->second.lru_iterator);
+    if (env_->NowSeconds() - it->second.timestamp > max_age_) {
+      cache_.erase(it);
+      return false;
+    }
+    *value = it->second.value;
+    lru_list_.push_front(it->first);
+    it->second.lru_iterator = lru_list_.begin();
+    return true;
+  }
+
+  void InsertLocked(const string& key, const T& value)
+      TF_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+    lru_list_.push_front(key);
+    Entry entry{env_->NowSeconds(), value, lru_list_.begin()};
+    auto insert = cache_.insert(std::make_pair(key, entry));
+    if (!insert.second) {
+      lru_list_.erase(insert.first->second.lru_iterator);
+      insert.first->second = entry;
+    } else if (max_entries_ > 0 && cache_.size() > max_entries_) {
+      cache_.erase(lru_list_.back());
+      lru_list_.pop_back();
+    }
+  }
+
+  bool DeleteLocked(const string& key) TF_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+    auto it = cache_.find(key);
+    if (it == cache_.end()) {
+      return false;
+    }
+    lru_list_.erase(it->second.lru_iterator);
+    cache_.erase(it);
+    return true;
+  }
+
   /// The maximum age of entries in the cache, in seconds. A value of 0 means
   /// that no entry is ever placed in the cache.
   const uint64 max_age_;
@@ -114,11 +175,11 @@ class ExpiringLRUCache {
   mutex mu_;
 
   /// The cache (a map from string key to Entry).
-  std::map<string, Entry> cache_ GUARDED_BY(mu_);
+  std::map<string, Entry> cache_ TF_GUARDED_BY(mu_);
 
   /// The LRU list of entries. The front of the list identifies the most
   /// recently accessed entry.
-  std::list<string> lru_list_ GUARDED_BY(mu_);
+  std::list<string> lru_list_ TF_GUARDED_BY(mu_);
 };
 
 }  // namespace tensorflow

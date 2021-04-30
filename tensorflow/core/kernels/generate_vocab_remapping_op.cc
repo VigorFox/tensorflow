@@ -41,6 +41,8 @@ class GenerateVocabRemappingOp : public OpKernel {
     OP_REQUIRES_OK(context,
                    context->GetAttr("new_vocab_offset", &new_vocab_offset_));
     OP_REQUIRES_OK(context, context->GetAttr("num_new_vocab", &num_new_vocab_));
+    OP_REQUIRES_OK(context,
+                   context->GetAttr("old_vocab_size", &old_vocab_size_));
   }
 
   void Compute(OpKernelContext* context) override {
@@ -55,11 +57,11 @@ class GenerateVocabRemappingOp : public OpKernel {
 
     // Build a new ID->token lookup table.
     const string& new_vocab_filename =
-        new_vocab_file_tensor->scalar<string>()();
+        new_vocab_file_tensor->scalar<tstring>()();
     OP_REQUIRES(context, !new_vocab_filename.empty(),
                 errors::InvalidArgument("new vocab filename cannot be empty."));
-    lookup::HashTable<int64, string>* new_vocab_table =
-        new lookup::HashTable<int64, string>(context, this);
+    lookup::HashTable<int64, tstring>* new_vocab_table =
+        new lookup::HashTable<int64, tstring>(context, this);
     core::ScopedUnref unref_new(new_vocab_table);
     // Note: we pass -1 (unknown) for vocab_size, which is supposed to be the
     // total elements in file.  This is different from num_new_vocab_, which
@@ -70,6 +72,7 @@ class GenerateVocabRemappingOp : public OpKernel {
                                 kUnusedLookupDelim,
                                 -1,  // key_index, use the line number.
                                 -2,  // value_index, use the whole line/token.
+                                0,   // No offset.
                                 context->env(), new_vocab_table));
     OP_REQUIRES(context,
                 new_vocab_offset_ + num_new_vocab_ <= new_vocab_table->size(),
@@ -86,22 +89,21 @@ class GenerateVocabRemappingOp : public OpKernel {
                     old_vocab_file_tensor->shape().DebugString()));
     // Build a token->old ID lookup table.
     const string& old_vocab_filename =
-        old_vocab_file_tensor->scalar<string>()();
+        old_vocab_file_tensor->scalar<tstring>()();
     OP_REQUIRES(context, !old_vocab_filename.empty(),
                 errors::InvalidArgument("new vocab filename cannot be empty."));
-    lookup::HashTable<string, int64>* old_vocab_table =
-        new lookup::HashTable<string, int64>(context, this);
+    lookup::HashTable<tstring, int64>* old_vocab_table =
+        new lookup::HashTable<tstring, int64>(context, this);
     core::ScopedUnref unref_old(old_vocab_table);
-    // Note: we pass -1 (unknown) for vocab_size, which is supposed to be the
-    // total elements in file.  This is different from num_new_vocab_, which
-    // accounts for partitioning.
-    OP_REQUIRES_OK(context, lookup::InitializeTableFromTextFile(
-                                old_vocab_filename,
-                                -1,  // vocab_size
-                                kUnusedLookupDelim,
-                                -2,  // key_index, use the whole line/token.
-                                -1,  // value_index, use the line number.
-                                context->env(), old_vocab_table));
+    // Note: If old_vocab_size_ is -1 (unknown), we retrieve all elements in
+    // file (see TextFileLineIterator).
+    OP_REQUIRES_OK(context,
+                   lookup::InitializeTableFromTextFile(
+                       old_vocab_filename, old_vocab_size_, kUnusedLookupDelim,
+                       -2,  // key_index, use the whole line/token.
+                       -1,  // value_index, use the line number.
+                       0,   // No offset.
+                       context->env(), old_vocab_table));
 
     // Fill out new_ids = [new_vocab_offset, new_vocab_offset + 1, ...,
     //                     new_vocab_offset + num_new_vocab_]
@@ -118,7 +120,7 @@ class GenerateVocabRemappingOp : public OpKernel {
     OP_REQUIRES_OK(
         context, context->allocate_temp(
                      DT_STRING, TensorShape({num_new_vocab_}), &default_token));
-    auto default_token_vec = default_token.vec<string>();
+    auto default_token_vec = default_token.vec<tstring>();
     default_token_vec.setConstant("" /* NOT_FOUND_TOKEN */);
 
     Tensor default_id;
@@ -165,6 +167,7 @@ class GenerateVocabRemappingOp : public OpKernel {
  private:
   int new_vocab_offset_;
   int num_new_vocab_;
+  int old_vocab_size_;
 };
 
 REGISTER_KERNEL_BUILDER(Name("GenerateVocabRemapping").Device(DEVICE_CPU),

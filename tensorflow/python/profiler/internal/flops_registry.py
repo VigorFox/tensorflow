@@ -124,7 +124,7 @@ def _l2_loss_flops(graph, node):
 @ops.RegisterStatistics("Softmax", "flops")
 def _softmax_flops(graph, node):
   """Compute flops for Softmax operation."""
-  # Softmax implenetation:
+  # Softmax implemetation:
   #
   # Approximate flops breakdown:
   #   2*n          -- compute shifted logits
@@ -313,7 +313,7 @@ def _pool_flops(graph, node):
   #     - padding
   #     - data_format
   #
-  # Pooling implenetation:
+  # Pooling implemetation:
   out_shape = graph_util.tensor_shape_from_node_def_name(graph, node.name)
   out_shape.assert_is_fully_defined()
   kernel_shape = list(node.attr["ksize"].list.i)
@@ -373,6 +373,7 @@ def _max_pool_grad_flops(graph, node):
   kernel_area = _list_product(kernel_shape)
   orig_out_shape = graph_util.tensor_shape_from_node_def_name(graph,
                                                               node.input[1])
+  orig_out_shape.assert_is_fully_defined()
   max_pool_ops = kernel_area * orig_out_shape.num_elements()
   return ops.OpStats("flops", max_pool_ops + orig_out_shape.num_elements())
 
@@ -406,7 +407,7 @@ def _conv_2d_backprop_input_flops(graph, node):
   return ops.OpStats("flops",
                      (2 * out_shape.num_elements()
                       * kernel_shape.num_elements()
-                      / (out_shape[-1].value * strides_product)))
+                      / (out_shape.dims[-1].value * strides_product)))
 
 
 @ops.RegisterStatistics("Conv2DBackpropFilter", "flops")
@@ -429,7 +430,7 @@ def _conv_2d_backprop_filter_flops(graph, node):
   return ops.OpStats("flops",
                      (2 * image_shape.num_elements()
                       * kernel_shape.num_elements()
-                      / (image_shape[-1].value * strides_product)))
+                      / (image_shape.dims[-1].value * strides_product)))
 
 ################################################################################
 # Other ops

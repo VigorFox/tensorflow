@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/core/distributed_runtime/rpc/grpc_util.h"
+
 #include "tensorflow/core/platform/test.h"
 #include "tensorflow/core/platform/test_benchmark.h"
 #include "tensorflow/core/protobuf/worker.pb.h"
@@ -67,7 +68,20 @@ TEST(GrpcProto, Unparse) {
   proto.add_container("hello");
   proto.add_container("world");
   grpc::ByteBuffer buf;
-  GrpcUnparseProto(proto, &buf);
+  ASSERT_TRUE(GrpcMaybeUnparseProto(proto, &buf).ok());
+  CleanupAllRequest parsed;
+  ASSERT_TRUE(parsed.ParseFromString(ToString(buf)));
+  ASSERT_EQ(proto.DebugString(), parsed.DebugString());
+}
+
+TEST(GrpcProto, UnparseToString) {
+  CleanupAllRequest proto;
+  proto.add_container("hello");
+  proto.add_container("world");
+  string str;
+  CHECK(proto.SerializeToString(&str));
+  grpc::ByteBuffer buf;
+  ASSERT_TRUE(GrpcMaybeUnparseProto(str, &buf).ok());
   CleanupAllRequest parsed;
   ASSERT_TRUE(parsed.ParseFromString(ToString(buf)));
   ASSERT_EQ(proto.DebugString(), parsed.DebugString());
@@ -90,48 +104,72 @@ TEST(GrpcProto, Parse) {
     CleanupAllRequest proto = MakeProto(c.length);
     ::grpc::ByteBuffer src = MakeBuffer(proto.SerializeAsString(), c.slices);
     CleanupAllRequest parsed;
-    ASSERT_TRUE(GrpcParseProto(src, &parsed)) << c.length << " " << c.slices;
+    ASSERT_TRUE(GrpcMaybeParseProto(&src, &parsed))
+        << c.length << " " << c.slices;
     ASSERT_EQ(proto.DebugString(), parsed.DebugString());
   }
 }
 
-static void BM_UnparseGrpc(int iters, int size) {
-  testing::StopTiming();
-  auto proto = MakeProto(size);
-  testing::StartTiming();
-  for (int i = 0; i < iters; i++) {
-    grpc::ByteBuffer buf;
-    GrpcUnparseProto(proto, &buf);
+TEST(GrpcProto, ParseFromString) {
+  // Test with serialization broken up into a bunch of slices.
+  struct Case {
+    int length;
+    int slices;
+  };
+  for (Case c : std::vector<Case>{
+           {0, 1},
+           {20, 1},
+           {100, 1},
+           {1 << 20, 1},
+           {100, 5},
+           {10000, 50},
+       }) {
+    CleanupAllRequest proto = MakeProto(c.length);
+    ::grpc::ByteBuffer src = MakeBuffer(proto.SerializeAsString(), c.slices);
+    string parsed_str;
+    CleanupAllRequest parsed;
+    ASSERT_TRUE(GrpcMaybeParseProto(&src, &parsed_str))
+        << c.length << " " << c.slices;
+    ASSERT_TRUE(parsed.ParseFromString(parsed_str));
+    ASSERT_EQ(proto.DebugString(), parsed.DebugString());
   }
-  testing::StopTiming();
+}
+
+static void BM_UnparseGrpc(::testing::benchmark::State& state) {
+  const int size = state.range(0);
+
+  auto proto = MakeProto(size);
+  for (auto s : state) {
+    grpc::ByteBuffer buf;
+    CHECK(GrpcMaybeUnparseProto(proto, &buf).ok());
+  }
 }
 BENCHMARK(BM_UnparseGrpc)->Arg(1)->Arg(1 << 10)->Arg(1 << 20);
 
-static void BM_UnparseString(int iters, int size) {
-  testing::StopTiming();
+static void BM_UnparseString(::testing::benchmark::State& state) {
+  const int size = state.range(0);
+
   auto proto = MakeProto(size);
   testing::StartTiming();
 
-  for (int i = 0; i < iters; i++) {
+  for (auto s : state) {
     string buf;
     proto.SerializeToString(&buf);
   }
-
-  testing::StopTiming();
 }
 BENCHMARK(BM_UnparseString)->Arg(1)->Arg(1 << 10)->Arg(1 << 20);
 
-static void BM_ParseGrpc(int iters, int size, int num_slices) {
-  testing::StopTiming();
+static void BM_ParseGrpc(::testing::benchmark::State& state) {
+  const int size = state.range(0);
+  const int num_slices = state.range(1);
+
   CleanupAllRequest proto = MakeProto(size);
   auto buf = MakeBuffer(proto.SerializeAsString(), num_slices);
   testing::StartTiming();
 
-  for (int i = 0; i < iters; i++) {
-    CHECK(GrpcParseProto(buf, &proto));
+  for (auto s : state) {
+    CHECK(GrpcMaybeParseProto(&buf, &proto));
   }
-
-  testing::StopTiming();
 }
 BENCHMARK(BM_ParseGrpc)
     ->ArgPair(1, 1)
@@ -140,17 +178,16 @@ BENCHMARK(BM_ParseGrpc)
     ->ArgPair(1 << 20, 1)
     ->ArgPair(1 << 20, 4);
 
-static void BM_ParseString(int iters, int size) {
-  testing::StopTiming();
+static void BM_ParseString(::testing::benchmark::State& state) {
+  const int size = state.range(0);
+
   CleanupAllRequest proto = MakeProto(size);
   string serial = proto.SerializeAsString();
   testing::StartTiming();
 
-  for (int i = 0; i < iters; i++) {
+  for (auto s : state) {
     CHECK(proto.ParseFromString(serial));
   }
-
-  testing::StopTiming();
 }
 BENCHMARK(BM_ParseString)->Arg(1)->Arg(1 << 10)->Arg(1 << 20);
 

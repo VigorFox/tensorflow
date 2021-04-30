@@ -22,6 +22,7 @@ limitations under the License.
 #include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/platform/test.h"
 #include "tensorflow/core/platform/test_benchmark.h"
+#include "tensorflow/core/protobuf/error_codes.pb.h"
 
 namespace tensorflow {
 class TensorShapeTestHelper {
@@ -68,6 +69,53 @@ TEST(TensorShapeTest, RemoveAndAddDim) {
 
   EXPECT_EQ(20000, s.num_elements());
   ASSERT_EQ(3, s.dims());
+}
+
+TEST(TensorShapeTest, RemoveLastDims) {
+  TensorShape s({2, 3, 5, 7});
+  s.RemoveLastDims(1);
+
+  ASSERT_EQ(3, s.dims());
+  EXPECT_EQ(30, s.num_elements());
+
+  s.RemoveLastDims(2);
+  ASSERT_EQ(1, s.dims());
+  EXPECT_EQ(2, s.dim_size(0));
+}
+
+TEST(TensorShapeTest, RemoveDimRange) {
+  TensorShape s0({2, 3, 5, 7});
+  // Empty interval => noop.
+  for (int i = -4; i <= 4; ++i) {
+    s0.RemoveDimRange(i, i);
+    ASSERT_EQ(4, s0.dims());
+    ASSERT_EQ(210, s0.num_elements());
+  }
+
+  // Positive begin and end.
+  s0.RemoveDimRange(3, 1);  // Empty interval.
+  ASSERT_EQ(4, s0.dims());
+  ASSERT_EQ(210, s0.num_elements());
+  s0.RemoveDimRange(0, 3);
+  ASSERT_EQ(1, s0.dims());
+  EXPECT_EQ(7, s0.dim_size(0));
+  TensorShape s1({2, 3, 5, 7});
+  s1.RemoveDimRange(2, 3);
+  ASSERT_EQ(3, s1.dims());
+  ASSERT_EQ(42, s1.num_elements());
+
+  // Negative begin or end.
+  TensorShape s2({2, 3, 5, 7});
+  s2.RemoveDimRange(-2, -3);  // Empty interval.
+  ASSERT_EQ(4, s2.dims());
+  ASSERT_EQ(210, s2.num_elements());
+  s2.RemoveDimRange(0, -2);
+  ASSERT_EQ(1, s2.dims());
+  ASSERT_EQ(7, s2.dim_size(0));
+  TensorShape s3({2, 3, 5, 7});
+  s3.RemoveDimRange(-3, -2);
+  ASSERT_EQ(3, s3.dims());
+  ASSERT_EQ(42, s3.num_elements());
 }
 
 TEST(TensorShapeTest, InvalidShapeProto) {
@@ -149,6 +197,35 @@ TEST(TensorShapeTest, DataType) {
   EXPECT_EQ(TensorShapeTestHelper::data_type(&s2), DT_FLOAT);
   s2.Clear();
   EXPECT_EQ(TensorShapeTestHelper::data_type(&s2), DT_INVALID);
+}
+
+TEST(TensorShapeTest, ostream) {
+  TensorShape s({10, 5, 4});
+  std::stringstream ss;
+  ss << s;
+  EXPECT_EQ(ss.str(), "[10,5,4]");
+}
+
+TEST(TensorShapeTest, AddDimWithStatus) {
+  TensorShape s({10, 5, 20});
+  Status status = s.AddDimWithStatus(400);
+  EXPECT_TRUE(status.ok());
+  EXPECT_EQ(400000, s.num_elements());
+  ASSERT_EQ(4, s.dims());
+
+  status = s.AddDimWithStatus(-1);
+  EXPECT_EQ(tensorflow::error::INTERNAL, status.code());
+}
+
+TEST(TensorShapeTest, Factory) {
+  TensorShape s;
+  Status status = TensorShape::BuildTensorShapeBase({10, 5, 20}, &s);
+  EXPECT_TRUE(status.ok());
+  EXPECT_EQ(1000, s.num_elements());
+  ASSERT_EQ(3, s.dims());
+
+  status = TensorShape::BuildTensorShapeBase({-10, 5, 20}, &s);
+  EXPECT_EQ(tensorflow::error::INTERNAL, status.code());
 }
 
 // -----------------------------------------------------------------------
@@ -312,7 +389,8 @@ Status TensorShapeOld::IsValidShape(const TensorShapeProto& proto) {
   for (const auto& d : proto.dim()) {
     if (d.size() < 0) {
       return errors::InvalidArgument("Shape ", DebugString(proto),
-                                     " has negative dimensions");
+                                     " has negative dimensions; ",
+                                     "perhaps an un-fed placeholder?");
     }
     num_elements *= d.size();
     if (num_elements > kMaxElements) {
@@ -424,7 +502,7 @@ TensorShapeIterOld TensorShapeOld::end() const {
 
 string TensorShapeOld::DebugString() const {
   return strings::StrCat(
-      "[", str_util::Join(gtl::ArraySlice<int64>(dim_sizes_), ","), "]");
+      "[", absl::StrJoin(gtl::ArraySlice<int64>(dim_sizes_), ","), "]");
 }
 
 string TensorShapeOld::DebugString(const TensorShapeProto& proto) {
@@ -534,7 +612,8 @@ TEST(TensorShapeTest, Large) {
 TEST(TensorShapeTest, Overflow) {
   int64 one = 1;
   std::vector<std::vector<int64>> overflows = {
-      {1 << 30, 1 << 30, 1 << 30}, {1 << 5, (one << 60) + 1},
+      {1 << 30, 1 << 30, 1 << 30},
+      {1 << 5, (one << 60) + 1},
   };
   for (const auto& overflow : overflows) {
     TensorShapeProto proto;
@@ -628,21 +707,38 @@ static std::vector<int64> MakeSizes(int arg) {
   return sizes;
 }
 
-static void BM_TensorShape_Assign(int iters, int arg) {
-  TensorShape s(MakeSizes(arg));
-  while (--iters > 0) {
-    TensorShape s2 = s;
+void BM_TensorShape_Init(::testing::benchmark::State& state) {
+  const int arg = state.range(0);
+
+  auto sizes = MakeSizes(arg);
+  for (auto s : state) {
+    TensorShape shape(sizes);
+    tensorflow::testing::DoNotOptimize(shape.num_elements());
+  }
+}
+BENCHMARK(BM_TensorShape_Init)->Arg(0)->Arg(1)->Arg(2)->Arg(3)->Arg(4);
+
+void BM_TensorShape_Assign(::testing::benchmark::State& state) {
+  const int arg = state.range(0);
+
+  TensorShape shape(MakeSizes(arg));
+  for (auto s : state) {
+    const TensorShape s2 = shape;
+    tensorflow::testing::DoNotOptimize(s2);
   }
 }
 BENCHMARK(BM_TensorShape_Assign)->Arg(0)->Arg(1)->Arg(2)->Arg(3)->Arg(4);
 
-static void BM_TensorShapeOld_Assign(int iters, int arg) {
-  TensorShapeOld sold(MakeSizes(arg));
-  while (--iters > 0) {
-    TensorShapeOld sold2 = sold;
+void BM_TensorShape_SetDim(::testing::benchmark::State& state) {
+  const int arg = state.range(0);
+
+  TensorShape shape(MakeSizes(arg));
+  tensorflow::testing::DoNotOptimize(shape);
+  for (auto s : state) {
+    shape.set_dim(0, 8);
   }
 }
-BENCHMARK(BM_TensorShapeOld_Assign)->Arg(0)->Arg(1)->Arg(2)->Arg(3)->Arg(4);
+BENCHMARK(BM_TensorShape_SetDim)->Arg(0)->Arg(1)->Arg(2)->Arg(3)->Arg(4);
 
 }  // namespace
 }  // namespace tensorflow

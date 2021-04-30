@@ -16,18 +16,24 @@ limitations under the License.
 #include "tensorflow/core/profiler/internal/tfprof_stats.h"
 
 #include <stdio.h>
+
 #include <utility>
 
+#include "absl/strings/numbers.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/str_split.h"
 #include "tensorflow/core/framework/step_stats.pb.h"
-#include "tensorflow/core/lib/strings/str_util.h"
 #include "tensorflow/core/platform/regexp.h"
 #include "tensorflow/core/profiler/internal/tfprof_timeline.h"
 
 namespace tensorflow {
 namespace tfprof {
 namespace {
+
+const char* const kProfilePrefix = "Profile:\n";
+
 bool CreateRunMetadataNode(const string& name, NodeDef* def) {
-  // TODO(xpan): Better solution than blacklisting this 2 nodes. They
+  // TODO(xpan): Better solution than denylisting this 2 nodes. They
   // actually cost some resources, maybe include them. Some nodes, such
   // as _SOURCE appear in multiple devices, which breaks tfprof's assumption.
   if (name == "RecvTensor" || name == "_SOURCE" ||
@@ -36,7 +42,9 @@ bool CreateRunMetadataNode(const string& name, NodeDef* def) {
   }
   def->set_name(name);
   // TODO(xpan): Better operation type.
-  def->set_op("RunTimeOp");
+  // This is because some times a node doesn't have a op type,
+  // so we use node name as the op type.
+  def->set_op(name);
   return true;
 }
 }  // namespace
@@ -46,10 +54,10 @@ TFStats::TFStats(std::unique_ptr<GraphDef> graph,
                  std::unique_ptr<OpLogProto> op_log,
                  std::unique_ptr<checkpoint::CheckpointReader> ckpt_reader)
     : has_code_traces_(false),
+      miss_accelerator_stream_(false),
       ckpt_reader_(std::move(ckpt_reader)) {
   CHECK(graph) << "Must at least have GraphDef";
 
-  printf("Parsing Inputs...\n");
   AddGraph(std::move(graph));
   if (run_meta && run_meta->has_step_stats()) {
     AddRunMeta(0, std::move(run_meta));
@@ -68,22 +76,27 @@ TFStats::TFStats(std::unique_ptr<GraphDef> graph,
 
 TFStats::TFStats(const string& filename,
                  std::unique_ptr<checkpoint::CheckpointReader> ckpt_reader)
-    : has_code_traces_(false), ckpt_reader_(std::move(ckpt_reader)) {
+    : has_code_traces_(false),
+      miss_accelerator_stream_(false),
+      ckpt_reader_(std::move(ckpt_reader)) {
   string str;
   Status s = ReadFileToString(Env::Default(), filename, &str);
   if (!s.ok()) {
-    fprintf(stderr, "Failed to read profile: %s", s.ToString().c_str());
+    absl::FPrintF(stderr, "Failed to read profile: %s", s.ToString());
     return;
   }
 
   ProfileProto profile;
   if (!profile.ParseFromString(str)) {
-    fprintf(stderr, "Failed to parse profile\n");
+    absl::FPrintF(stderr, "Failed to parse profile\n");
     return;
   }
-
+  for (const auto& entry : profile.id_to_string()) {
+    id_to_string_[entry.first] = entry.second;
+  }
   for (const auto& node_pb : profile.nodes()) {
-    std::unique_ptr<TFGraphNode> node(new TFGraphNode(node_pb.second, profile));
+    std::unique_ptr<TFGraphNode> node(
+        new TFGraphNode(node_pb.second, profile, &id_to_string_, &nodes_map_));
     nodes_map_.insert(std::pair<string, std::unique_ptr<TFGraphNode>>(
         node_pb.second.name(), std::move(node)));
   }
@@ -136,20 +149,23 @@ const GraphNodeProto& TFStats::ShowGraphNode(const string& cmd,
   if (!Validate(opts)) {
     return empty_graph_node_;
   }
+  string prefix = MaybeReportMissingTrace();
+  prefix += QueryDoc(cmd, opts) + kProfilePrefix;
+
   if (cmd == kCmds[0]) {
-    return scope_view_->Show(opts);
+    return scope_view_->Show(prefix, opts);
   } else if (cmd == kCmds[1]) {
     if (opts.step < 0 && opts.output_type == kOutput[0]) {
       for (int64 step : steps_) {
         Options nopts = opts;
         nopts.step = step;
-        graph_view_->Show(nopts);
+        graph_view_->Show(prefix, nopts);
       }
       return empty_graph_node_;
     }
-    return graph_view_->Show(opts);
+    return graph_view_->Show(prefix, opts);
   } else {
-    fprintf(stderr, "Unknown command: %s\n", cmd.c_str());
+    absl::FPrintF(stderr, "Unknown command: %s\n", cmd);
     return empty_graph_node_;
   }
 }
@@ -159,28 +175,34 @@ const MultiGraphNodeProto& TFStats::ShowMultiGraphNode(
   if (!Validate(opts)) {
     return empty_multi_graph_node_;
   }
+  string prefix = MaybeReportMissingTrace();
+  prefix += QueryDoc(cmd, opts) + kProfilePrefix;
+
   if (cmd == kCmds[2]) {
     if (!has_code_traces()) {
-      fprintf(stderr, "No code trace information\n");
+      absl::FPrintF(stderr, "No code trace information\n");
       return empty_multi_graph_node_;
     }
-    return code_view_->Show(opts);
+    return code_view_->Show(prefix, opts);
   } else if (cmd == kCmds[3]) {
-    return op_view_->Show(opts);
+    return op_view_->Show(prefix, opts);
   } else {
-    fprintf(stderr, "Unknown command: %s\n", cmd.c_str());
+    absl::FPrintF(stderr, "Unknown command: %s\n", cmd);
     return empty_multi_graph_node_;
   }
 }
 
 void TFStats::AddGraph(std::unique_ptr<GraphDef> graph) {
   std::map<string, const NodeDef*> node_defs;
+  bool node_added = false;
   for (const NodeDef& node : graph->node()) {
     if (nodes_map_.find(node.name()) != nodes_map_.end()) {
       continue;
     }
-    nodes_map_[node.name()] =
-        std::unique_ptr<TFGraphNode>(new TFGraphNode(&node, nodes_map_.size()));
+    node_added = true;
+    size_t num_nodes = nodes_map_.size();
+    nodes_map_[node.name()] = std::unique_ptr<TFGraphNode>(
+        new TFGraphNode(&node, num_nodes, &nodes_map_));
     node_defs[node.name()] = &node;
   }
   for (auto it = node_defs.begin(); it != node_defs.end(); it++) {
@@ -189,32 +211,41 @@ void TFStats::AddGraph(std::unique_ptr<GraphDef> graph) {
       string node_input = it->second->input(i);
       int output_idx = 0;
       // input name format can be: "^node:src_output"
-      auto prefix_pos = node_input.find(":");
+      // if not :src_output, then it's the first one (further verify?)
+      auto prefix_pos = node_input.find(':');
       if (prefix_pos != node_input.npos) {
-        std::vector<string> input_parts = str_util::Split(node_input, ":");
-        CHECK(input_parts.size() == 2)
+        std::vector<string> input_parts = absl::StrSplit(node_input, ':');
+        DCHECK(input_parts.size() == 2)
             << "Unknown NodeDef.input format: " << node_input;
         node_input = input_parts[0];
-        CHECK(strings::safe_strto32(input_parts[1], &output_idx))
+        DCHECK(absl::SimpleAtoi(input_parts[1], &output_idx))
             << "Failed to parse integer: " << output_idx;
       }
       if (node_input.substr(0, 1) == "^") {
         node_input = node_input.substr(1);
       }
-      auto input_node = nodes_map_.find(node_input);
-      // TODO(xpan): P1: Add the input even if it doesn't exist yet, because
-      // this can be a partial graph.
-      if (input_node == nodes_map_.end()) {
-        continue;
-      }
-      node->AddInput(input_node->second.get(), output_idx, i);
+      // Delay input TFGraphNode retrieval as late as possible.
+      // In long run, when we have TensorFlow runtime graph, the
+      // graph connection should be dynamic and per-step.
+      node->AddInput(node_input, output_idx, i);
     }
+  }
+  if (node_added) {
+    graph_view_.reset(nullptr);
+    scope_view_.reset(nullptr);
+    op_view_.reset(nullptr);
+    code_view_.reset(nullptr);
   }
 }
 
 void TFStats::AddOpLogProto(std::unique_ptr<OpLogProto> op_log) {
   if (!op_log) {
     return;
+  }
+  for (const auto& entry : op_log->id_to_string()) {
+    if (id_to_string_.find(entry.first) == id_to_string_.end()) {
+      id_to_string_[entry.first] = entry.second;
+    }
   }
   for (const OpLogEntry& entry : op_log->log_entries()) {
     auto node = nodes_map_.find(entry.name());
@@ -227,16 +258,14 @@ void TFStats::AddOpLogProto(std::unique_ptr<OpLogProto> op_log) {
     }
     if (entry.has_code_def()) {
       has_code_traces_ = true;
-      if (node->second->code().traces_size() == 0) {
-        node->second->AddCode(entry.code_def());
-      }
+      node->second->AddCode(entry.code_def(), &id_to_string_);
     }
   }
 }
 
 void TFStats::AddRunMeta(int64 step, std::unique_ptr<RunMetadata> run_meta) {
   if (!run_meta || !run_meta->has_step_stats()) {
-    fprintf(stderr, "Invalid RunMetadata for step %lld\n", step);
+    absl::FPrintF(stderr, "Invalid RunMetadata for step %d\n", step);
     return;
   }
   if (steps_.find(step) == steps_.end()) {
@@ -244,11 +273,21 @@ void TFStats::AddRunMeta(int64 step, std::unique_ptr<RunMetadata> run_meta) {
   }
   steps_.insert(step);
 
+  bool has_gpu_scheduling = false;
+  bool has_gpu_stream = false;
+
   for (const auto& dev_stat : run_meta->step_stats().dev_stats()) {
+    string dev = absl::AsciiStrToLower(dev_stat.device());
+    if (IsPlacedOnAccelerator(dev)) {
+      has_gpu_scheduling = true;
+      if (CountAsAcceleratorTime(dev)) {
+        has_gpu_stream = true;
+      }
+    }
     for (const NodeExecStats& node_stat : dev_stat.node_stats()) {
       string name = node_stat.node_name();
       // Sometimes the node_name is suffixed with unnecessary information.
-      auto split_pos = node_stat.node_name().find(":");
+      auto split_pos = node_stat.node_name().find(':');
       if (split_pos != node_stat.node_name().npos) {
         name = node_stat.node_name().substr(0, split_pos);
       }
@@ -256,19 +295,41 @@ void TFStats::AddRunMeta(int64 step, std::unique_ptr<RunMetadata> run_meta) {
       if (node == nodes_map_.end()) {
         NodeDef def;
         if (CreateRunMetadataNode(name, &def)) {
+          size_t num_nodes = nodes_map_.size();
           nodes_map_[name] = std::unique_ptr<TFGraphNode>(
-              new TFGraphNode(&def, nodes_map_.size()));
+              new TFGraphNode(&def, num_nodes, &nodes_map_));
           nodes_map_.at(name)->AddStepStat(step, dev_stat.device(), node_stat);
         }
       } else {
+        covered_nodes_.insert(node->second->id());
         node->second->AddStepStat(step, dev_stat.device(), node_stat);
       }
     }
   }
+
+  if (has_gpu_scheduling && !has_gpu_stream) {
+    miss_accelerator_stream_ = true;
+  }
 }
 
-void TFStats::WriteProfile(const string& filename) {
+string TFStats::MaybeReportMissingTrace() const {
+  string report = "";
+  if (miss_accelerator_stream_) {
+    report +=
+        "\n\nFound accelerator operation but misses accelerator "
+        "stream stats!\n\n"
+        "It's likely a gpu tracing issue rather than tf-profiler issue.\n"
+        "If you found your operation missing accelerator time, "
+        "consider to post to discuss@tensorflow.org!\n\n";
+  }
+  return report;
+}
+
+void TFStats::SerializeToString(string* content) {
   ProfileProto profile;
+  for (const auto& entry : id_to_string_) {
+    (*profile.mutable_id_to_string())[entry.first] = entry.second;
+  }
   for (auto it = nodes_map_.begin(); it != nodes_map_.end(); it++) {
     if (it->second->id() < 0) {
       continue;
@@ -278,24 +339,30 @@ void TFStats::WriteProfile(const string& filename) {
   }
 
   profile.set_has_trace(has_code_traces_);
+  profile.set_miss_accelerator_stream(miss_accelerator_stream_);
   for (int64 s : steps_) {
     profile.add_steps(s);
   }
-  Status s =
-      WriteStringToFile(Env::Default(), filename, profile.SerializeAsString());
+  *content = profile.SerializeAsString();
+}
+
+void TFStats::WriteProfile(const string& filename) {
+  string content;
+  SerializeToString(&content);
+  Status s = WriteStringToFile(Env::Default(), filename, content);
   if (!s.ok()) {
-    fprintf(stderr, "%s\n", s.ToString().c_str());
+    absl::FPrintF(stderr, "%s\n", s.ToString());
   }
 }
 
 bool TFStats::Validate(const Options& opts) const {
   if (opts.step >= 0 && steps_.find(opts.step) == steps_.end()) {
-    fprintf(stderr,
-            "Options -step=%lld not found.\nAvailable steps: ", opts.step);
+    absl::FPrintF(stderr,
+                  "Options -step=%d not found.\nAvailable steps: ", opts.step);
     for (int64 s : steps_) {
-      fprintf(stderr, "%lld ", s);
+      absl::FPrintF(stderr, "%d ", s);
     }
-    fprintf(stderr, "\n");
+    absl::FPrintF(stderr, "\n");
     return false;
   }
   return true;

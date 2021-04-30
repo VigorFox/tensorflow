@@ -15,84 +15,31 @@ limitations under the License.
 
 #include "tensorflow/compiler/xla/service/gpu/infeed_manager.h"
 
-#include "tensorflow/compiler/xla/map_util.h"
-#include "tensorflow/compiler/xla/ptr_util.h"
-#include "tensorflow/core/platform/logging.h"
+#include "absl/memory/memory.h"
 
-namespace se = ::perftools::gputools;
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+#include "tensorflow/compiler/xla/service/gpu/xla_executor_state.h"
+#include "tensorflow/stream_executor/gpu/gpu_executor.h"
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 namespace xla {
 namespace gpu {
 
-InfeedManager::InfeedManager() : host_to_device_executor_(nullptr) {}
-
-void InfeedManager::Reset() {
-  tensorflow::mutex_lock l(mu_);
-  CHECK(dequeued_buffer_.empty());
-  for (auto buffer : enqueued_buffer_) {
-    buffer->Done();
-  }
-  enqueued_buffer_.clear();
+InfeedManager::InfeedManager(se::StreamExecutor *executor)
+    : stream_(absl::make_unique<se::Stream>(executor)) {
+  stream_->Init();
 }
 
-void InfeedManager::EnqueueBuffers(const std::vector<InfeedBuffer*>& buffers) {
-  tensorflow::mutex_lock l(mu_);
-  bool was_empty = enqueued_buffer_.empty();
-  for (gpu::InfeedBuffer* b : buffers) {
-    enqueued_buffer_.push_back(b);
-  }
-  if (was_empty) {
-    // This has the potential to suffer from the notified thread
-    // immediately trying and failing to acquire mu_, but seems
-    // preferable to the alternative of notifying outside the lock
-    // on every enqueue.
-    cv_.notify_one();
-  }
-}
-
-InfeedBuffer* InfeedManager::BlockingDequeueBuffer() {
-  tensorflow::mutex_lock l(mu_);
-  while (enqueued_buffer_.empty()) {
-    cv_.wait(l);
-  }
-  InfeedBuffer* current_buffer = enqueued_buffer_.front();
-  enqueued_buffer_.pop_front();
-  dequeued_buffer_.insert(current_buffer);
-  return current_buffer;
-}
-
-void InfeedManager::ReleaseBuffers(const std::vector<InfeedBuffer*>& buffers) {
-  {
-    tensorflow::mutex_lock l(mu_);
-    for (gpu::InfeedBuffer* b : buffers) {
-      CHECK(ContainsKey(dequeued_buffer_, b));
-      dequeued_buffer_.erase(b);
-    }
-  }
-  for (gpu::InfeedBuffer* b : buffers) {
-    b->Done();
-  }
-}
-
-se::Stream* InfeedManager::GetStream(se::StreamExecutor* executor) {
-  if (host_to_device_executor_ == nullptr) {
-    host_to_device_executor_ = executor;
-    host_to_device_stream_ = MakeUnique<se::Stream>(executor);
-    host_to_device_stream_->Init();
-  }
-
-  if (executor != host_to_device_executor_) {
-    // The requested executor must be the same as the one for which
-    // the stream is cached.
-    return nullptr;
-  }
-
-  return host_to_device_stream_.get();
-}
-
-InfeedManager* GetOrCreateInfeedManager() {
-  static InfeedManager* manager = new InfeedManager;
-  return manager;
+InfeedManager *GetOrCreateInfeedManager(se::StreamExecutor *executor) {
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+  stream_executor::gpu::GpuExecutor *gpu_executor =
+      stream_executor::gpu::ExtractGpuExecutor(executor);
+  auto *xla_state =
+      gpu_executor->getOrCreateXLAState<GpuExecutorXLAState>(executor);
+  return xla_state->getOrCreateInfeedManager(executor);
+#else   // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+  return nullptr;
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 }
 
 }  // namespace gpu

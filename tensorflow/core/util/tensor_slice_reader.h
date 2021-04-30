@@ -15,10 +15,9 @@ limitations under the License.
 
 // The utility to read checkpoints for google brain tensor ops and v3
 // checkpoints for dist_belief.
-//
 
-#ifndef TENSORFLOW_UTIL_TENSOR_SLICE_READER_H_
-#define TENSORFLOW_UTIL_TENSOR_SLICE_READER_H_
+#ifndef TENSORFLOW_CORE_UTIL_TENSOR_SLICE_READER_H_
+#define TENSORFLOW_CORE_UTIL_TENSOR_SLICE_READER_H_
 
 #include <unordered_map>
 
@@ -62,7 +61,7 @@ class TensorSliceReader {
   };
   typedef std::function<Status(const string&, Table**)> OpenTableFunction;
 
-  static const int kLoadAllShards = -1;
+  static constexpr int kLoadAllShards = -1;
   TensorSliceReader(const string& filepattern);
   TensorSliceReader(const string& filepattern, OpenTableFunction open_function);
   TensorSliceReader(const string& filepattern, OpenTableFunction open_function,
@@ -103,8 +102,13 @@ class TensorSliceReader {
                    std::unique_ptr<tensorflow::Tensor>* out_tensor) const;
 
   typedef std::unordered_map<string, TensorShape> VarToShapeMap;
+  typedef std::unordered_map<string, DataType> VarToDataTypeMap;
+
   // Returns a map from tensor name to shape.
   VarToShapeMap GetVariableToShapeMap() const;
+
+  // Returns a map from tensor name to data type.
+  VarToDataTypeMap GetVariableToDataTypeMap() const;
 
   // Returns a string containing names and shapes of all the tensors.
   const string DebugString() const;
@@ -188,4 +192,4 @@ bool TensorSliceReader::CopySliceData(const string& name,
 
 }  // namespace tensorflow
 
-#endif  // TENSORFLOW_UTIL_TENSOR_SLICE_READER_H_
+#endif  // TENSORFLOW_CORE_UTIL_TENSOR_SLICE_READER_H_

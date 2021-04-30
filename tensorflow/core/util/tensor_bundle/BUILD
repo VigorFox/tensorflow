@@ -1,23 +1,32 @@
 # Description:
 #   Tensor bundle: a module to efficiently serialize and deserialize tensors.
 
-package(
-    default_visibility = ["//visibility:public"],
-)
-
-licenses(["notice"])  # Apache 2.0
-
+load("//tensorflow/core/platform:rules_cc.bzl", "cc_library")
 load(
     "//tensorflow:tensorflow.bzl",
-    "cc_header_only_library",
     "if_not_windows",
+    "if_windows",
+    "tf_cc_test",
     "tf_copts",
+)
+
+# buildifier: disable=same-origin-load
+load("//tensorflow:tensorflow.bzl", "cc_header_only_library")
+
+# buildifier: disable=same-origin-load
+load("//tensorflow:tensorflow.bzl", "filegroup")
+
+package(
+    default_visibility = ["//visibility:public"],
+    licenses = ["notice"],
 )
 
 # To be exported to tensorflow/core:mobile_srcs.
 filegroup(
     name = "mobile_srcs",
     srcs = [
+        "byte_swap.cc",
+        "byte_swap.h",
         "naming.cc",
         "naming.h",
         "tensor_bundle.cc",
@@ -32,17 +41,23 @@ alias(
 
 cc_library(
     name = "tensor_bundle",
-    srcs = ["tensor_bundle.cc"],
-    hdrs = ["tensor_bundle.h"],
+    srcs = [
+        "byte_swap.cc",
+        "tensor_bundle.cc",
+    ],
+    hdrs = [
+        "byte_swap.h",
+        "tensor_bundle.h",
+    ],
     copts = tf_copts() + if_not_windows(["-Wno-sign-compare"]),
+    linkopts = if_windows(["-DEFAULTLIB:ws2_32.lib"]),
     deps = [
         ":naming",
-        "//tensorflow/core:core_cpu_internal",
+        "//tensorflow/core:core_cpu_lib",
         "//tensorflow/core:framework",
         "//tensorflow/core:framework_internal",
         "//tensorflow/core:lib",
         "//tensorflow/core:lib_internal",
-        "//tensorflow/core:proto_text",
         "//tensorflow/core:protos_all_cc",
     ],
 )
@@ -60,32 +75,22 @@ cc_library(
     deps = ["//tensorflow/core:lib"],
 )
 
-cc_test(
+tf_cc_test(
     name = "tensor_bundle_test",
-    size = "small",
     srcs = ["tensor_bundle_test.cc"],
+    data = ["//tensorflow/core/util/tensor_bundle/testdata:old_string_tensors"],
+    tags = [
+        "nomsan",
+        "notsan",
+    ],
     deps = [
         ":tensor_bundle",
+        "//tensorflow/core:framework",
         "//tensorflow/core:lib",
         "//tensorflow/core:lib_internal",
         "//tensorflow/core:protos_all_cc",
-        "//tensorflow/core:tensor_testutil",
         "//tensorflow/core:test",
         "//tensorflow/core:test_main",
+        "//tensorflow/core/framework:tensor_testutil",
     ],
-)
-
-# -----------------------------------------------------------------------------
-# Google-internal targets.  These must be at the end for syncrepo.
-
-filegroup(
-    name = "all_files",
-    srcs = glob(
-        ["**/*"],
-        exclude = [
-            "**/METADATA",
-            "**/OWNERS",
-        ],
-    ),
-    visibility = ["//tensorflow:__subpackages__"],
 )
